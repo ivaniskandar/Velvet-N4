@@ -34,7 +34,6 @@
 #include <linux/slab.h>
 #include <linux/kernel_stat.h>
 #include <asm/cputime.h>
-#include <linux/touchboost.h>
 
 static int active_count;
 
@@ -113,21 +112,10 @@ static spinlock_t above_hispeed_delay_lock;
 static unsigned int *above_hispeed_delay = default_above_hispeed_delay;
 static int nabove_hispeed_delay = ARRAY_SIZE(default_above_hispeed_delay);
 
-/* 1000000us - 1s */
-#define DEFAULT_BOOSTPULSE_DURATION 1000000
-static int boostpulse_duration_val = DEFAULT_BOOSTPULSE_DURATION;
-#define DEFAULT_INPUT_BOOST_FREQ 1026000
-int input_boost_freq = DEFAULT_INPUT_BOOST_FREQ;
-
 /*
  * Making sure cpufreq stays low when it needs to stay low
  */
 #define DOWN_LOW_LOAD_THRESHOLD 5
-
-/*
- * Default thread migration boost cpufreq
- */
-#define CPU_SYNC_FREQ 702000
 
 /*
  * Max additional time to wait in idle, beyond timer_rate, at speeds above
@@ -396,7 +384,6 @@ static void cpufreq_interactive_timer(unsigned long data)
 	static unsigned int phase = 0;
 	static unsigned int counter = 0;
 	unsigned int nr_cpus;
-	bool boosted;
 
 	if (!down_read_trylock(&pcpu->enable_sem))
 		return;
@@ -420,7 +407,6 @@ static void cpufreq_interactive_timer(unsigned long data)
 	do_div(cputime_speedadj, delta_time);
 	loadadjfreq = (unsigned int)cputime_speedadj * 100;
 	cpu_load = loadadjfreq / pcpu->policy->cur;
-	boosted = now < (get_input_time() + boostpulse_duration_val);
 
 	if (counter < 5) {
 		counter++;
@@ -459,11 +445,6 @@ static void cpufreq_interactive_timer(unsigned long data)
 			else
 				new_freq = choose_freq(pcpu, loadadjfreq);
 	}
-
-	if (boosted) {
-		if (new_freq < input_boost_freq)
-			new_freq = input_boost_freq;
- 	}
 
 	if (counter > 0) {
 		counter--;
@@ -512,19 +493,6 @@ static void cpufreq_interactive_timer(unsigned long data)
 			spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
 			goto rearm;
 		}
-	}
-
-	/*
-	 * Update the timestamp for checking whether speed has been held at
-	 * or above the selected frequency for a minimum of min_sample_time,
-	 * if not boosted to hispeed_freq.  If boosted to hispeed_freq then we
-	 * allow the speed to drop as soon as the boostpulse duration expires
-	 * (or the indefinite boost is turned off).
-	 */
-
-	if (!boosted || new_freq > hispeed_freq) {
-		pcpu->floor_freq = new_freq;
-		pcpu->floor_validate_time = now;
 	}
 
 	/* In case actual freq set in target(policy->cur) is not updated
@@ -808,7 +776,6 @@ static int thread_migration_notify(struct notifier_block *nb,
 						unsigned long target_cpu, void *arg)
 {
 	unsigned long flags;
-	unsigned int boost_freq = CPU_SYNC_FREQ;
 	struct cpufreq_interactive_cpuinfo *target, *source;
 	target = &per_cpu(cpuinfo, target_cpu);
 	source = &per_cpu(cpuinfo, (int)arg);
@@ -822,11 +789,6 @@ static int thread_migration_notify(struct notifier_block *nb,
 
 	if (source->policy->cur > target->policy->cur)
 	{
-		if (source->policy->cur > boost_freq)
-		boost_freq = source->policy->cur;
-
-		target->target_freq = boost_freq;
-
 		spin_lock_irqsave(&speedchange_cpumask_lock, flags);
 		cpumask_set_cpu(target_cpu, &speedchange_cpumask);
 		spin_unlock_irqrestore(&speedchange_cpumask_lock, flags);
@@ -1129,30 +1091,6 @@ timer_rate = val_round;
 static struct global_attr timer_rate_attr = __ATTR(timer_rate, 0644,
 		show_timer_rate, store_timer_rate);
 
-static ssize_t show_input_boost_freq(struct kobject *kobj, struct attribute *attr,
-                                     char *buf)
-{
-	return sprintf(buf, "%d\n", input_boost_freq);
-}
-
-static ssize_t store_input_boost_freq(struct kobject *kobj, struct attribute *attr,
-                                      const char *buf, size_t count)
-{
-	int ret;
-	unsigned long val;
-
-	ret = strict_strtoul(buf, 0, &val);
-	if (ret < 0)
-		return ret;
-
-	input_boost_freq = val;
-	return count;
-
-}
-
-static struct global_attr input_boost_freq_attr = __ATTR(input_boost_freq, 0644,
-		show_input_boost_freq, store_input_boost_freq);
-
 static ssize_t show_timer_slack(
 	struct kobject *kobj, struct attribute *attr, char *buf)
 {
@@ -1175,29 +1113,6 @@ static ssize_t store_timer_slack(
 }
 
 define_one_global_rw(timer_slack);
-
-static ssize_t show_boostpulse_duration(
-	struct kobject *kobj, struct attribute *attr, char *buf)
-{
-	return sprintf(buf, "%d\n", boostpulse_duration_val);
-}
-
-static ssize_t store_boostpulse_duration(
-	struct kobject *kobj, struct attribute *attr, const char *buf,
-	size_t count)
-{
-	int ret;
-	unsigned long val;
-
-	ret = kstrtoul(buf, 0, &val);
-	if (ret < 0)
-		return ret;
-
-	boostpulse_duration_val = val;
-	return count;
-}
-
-define_one_global_rw(boostpulse_duration);
 
 static ssize_t show_io_is_busy(struct kobject *kobj,
 			struct attribute *attr, char *buf)
@@ -1273,10 +1188,8 @@ static struct attribute *interactive_attributes[] = {
 	&go_hispeed_load_attr.attr,
 	&min_sample_time_attr.attr,
 	&timer_rate_attr.attr,
-	&input_boost_freq_attr.attr,
 	&timer_slack.attr,
 	&io_is_busy_attr.attr,
-	&boostpulse_duration.attr,
 	&max_freq_hysteresis_attr.attr,
 	&two_phase_freq_attr.attr,
 	&align_windows_attr.attr,
